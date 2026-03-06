@@ -310,16 +310,9 @@ void drawBaseGrid() {
   float w = COLS * CELL_SIZE;
   float h = ROWS * CELL_SIZE;
 
-  translate(0, 0, -1); // 稍微下移避免与柱体底部产生 Z-fighting
-
-  // 绘制深色底板
-  fill(45);
-  noStroke();
-  rectMode(CENTER);
-  rect(0, 0, w + 20, h + 20);
-  rectMode(CORNER);
-
-  // 绘制网格线
+  // 在 Z=0 处保留参考网格线，代表压力为0的基准面
+  pushMatrix();
+  translate(0, 0, 0);
   stroke(80);
   strokeWeight(1);
   for (int r = 0; r <= ROWS; r++) {
@@ -331,76 +324,84 @@ void drawBaseGrid() {
     line(x, -h/2, 0, x, h/2, 0);
   }
   popMatrix();
+
+  popMatrix();
+}
+
+float getSafePressure(int r, int c) {
+  float p = displayPressureData[r][c];
+  return Float.isNaN(p) ? 0 : p;
 }
 
 void drawHeatmap3D() {
-  // 1. 绘制柱体与数值
-  for (int r = 0; r < ROWS; r++) {
+  // 1. 绘制连贯的平滑凹陷曲面 (Triangle Strip)
+  noStroke();
+  for (int r = 0; r < ROWS - 1; r++) {
+    beginShape(TRIANGLE_STRIP);
     for (int c = 0; c < COLS; c++) {
-      drawCell3D(r, c, displayPressureData[r][c]);
-    }
-  }
-
-  // 2. 绘制表面网格（增强效果）
-  noFill();
-  stroke(255, 120);
-  strokeWeight(1.5);
-  beginShape(LINES);
-  for (int r = 0; r < ROWS; r++) {
-    for (int c = 0; c < COLS; c++) {
+      // 顶点 1: 当前行
+      float p1 = getSafePressure(r, c);
       float x1 = (c - COLS/2.0 + 0.5) * CELL_SIZE;
       float y1 = (r - ROWS/2.0 + 0.5) * CELL_SIZE;
-      float p1 = displayPressureData[r][c];
-      float h1 = map(p1, PRESSURE_MIN, PRESSURE_MAX, 0, PRESSURE_HEIGHT_MAX);
+      // 负号实现凹陷：压力越大，Z值越小（越向下凹）
+      float z1 = map(p1, PRESSURE_MIN, PRESSURE_MAX, 0, -PRESSURE_HEIGHT_MAX);
+      fill(pressureToColor(p1));
+      vertex(x1, y1, z1);
 
-      // 连接右边节点
-      if (c < COLS - 1) {
-        float x2 = (c + 1 - COLS/2.0 + 0.5) * CELL_SIZE;
-        float p2 = displayPressureData[r][c+1];
-        float h2 = map(p2, PRESSURE_MIN, PRESSURE_MAX, 0, PRESSURE_HEIGHT_MAX);
-        vertex(x1, y1, h1);
-        vertex(x2, y1, h2);
-      }
-      // 连接下边节点
-      if (r < ROWS - 1) {
-        float y2 = (r + 1 - ROWS/2.0 + 0.5) * CELL_SIZE;
-        float p2 = displayPressureData[r+1][c];
-        float h2 = map(p2, PRESSURE_MIN, PRESSURE_MAX, 0, PRESSURE_HEIGHT_MAX);
-        vertex(x1, y1, h1);
-        vertex(x1, y2, h2);
-      }
+      // 顶点 2: 下一行
+      float p2 = getSafePressure(r + 1, c);
+      float x2 = (c - COLS/2.0 + 0.5) * CELL_SIZE;
+      float y2 = (r + 1 - ROWS/2.0 + 0.5) * CELL_SIZE;
+      float z2 = map(p2, PRESSURE_MIN, PRESSURE_MAX, 0, -PRESSURE_HEIGHT_MAX);
+      fill(pressureToColor(p2));
+      vertex(x2, y2, z2);
     }
+    endShape();
   }
-  endShape();
-}
 
-void drawCell3D(int r, int c, float pressure) {
-  if (Float.isNaN(pressure) || pressure <= 0.1) return; // 忽略微小压力和无效数据
+  // 2. 在曲面上方叠加浅色拓扑线框，增强视觉结构感
+  stroke(255, 40); // 半透明白线
+  strokeWeight(1);
+  noFill();
 
-  float x = (c - COLS/2.0 + 0.5) * CELL_SIZE;
-  float y = (r - ROWS/2.0 + 0.5) * CELL_SIZE;
-  float boxH = map(pressure, PRESSURE_MIN, PRESSURE_MAX, 0, PRESSURE_HEIGHT_MAX);
+  // 横向连接线
+  for (int r = 0; r < ROWS; r++) {
+    beginShape(LINES);
+    for (int c = 0; c < COLS - 1; c++) {
+      float p1 = getSafePressure(r, c);
+      float x1 = (c - COLS/2.0 + 0.5) * CELL_SIZE;
+      float y1 = (r - ROWS/2.0 + 0.5) * CELL_SIZE;
+      float z1 = map(p1, PRESSURE_MIN, PRESSURE_MAX, 0, -PRESSURE_HEIGHT_MAX);
 
-  color cellColor = pressureToColor(pressure);
+      float p2 = getSafePressure(r, c + 1);
+      float x2 = (c + 1 - COLS/2.0 + 0.5) * CELL_SIZE;
+      float y2 = y1;
+      float z2 = map(p2, PRESSURE_MIN, PRESSURE_MAX, 0, -PRESSURE_HEIGHT_MAX);
 
-  pushMatrix();
-  translate(x, y, boxH / 2.0); // box的绘制锚点在中心
+      vertex(x1, y1, z1);
+      vertex(x2, y2, z2);
+    }
+    endShape();
+  }
 
-  fill(cellColor);
-  noStroke(); // 无边框避免视觉杂乱
-  box(CELL_SIZE - 4, CELL_SIZE - 4, boxH);
+  // 纵向连接线
+  for (int c = 0; c < COLS; c++) {
+    beginShape(LINES);
+    for (int r = 0; r < ROWS - 1; r++) {
+      float p1 = getSafePressure(r, c);
+      float x1 = (c - COLS/2.0 + 0.5) * CELL_SIZE;
+      float y1 = (r - ROWS/2.0 + 0.5) * CELL_SIZE;
+      float z1 = map(p1, PRESSURE_MIN, PRESSURE_MAX, 0, -PRESSURE_HEIGHT_MAX);
 
-  popMatrix();
+      float p2 = getSafePressure(r + 1, c);
+      float x2 = x1;
+      float y2 = (r + 1 - ROWS/2.0 + 0.5) * CELL_SIZE;
+      float z2 = map(p2, PRESSURE_MIN, PRESSURE_MAX, 0, -PRESSURE_HEIGHT_MAX);
 
-  // 在柱体上方绘制数值标签
-  if (pressure > 2.0) { // 压力大于一定值才显示，避免拥挤
-    pushMatrix();
-    translate(x, y, boxH + 2);
-    fill(255);
-    textSize(11);
-    textAlign(CENTER, CENTER);
-    text(nf(pressure, 0, 1), 0, 0);
-    popMatrix();
+      vertex(x1, y1, z1);
+      vertex(x2, y2, z2);
+    }
+    endShape();
   }
 }
 
