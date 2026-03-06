@@ -15,6 +15,8 @@
  ***************************************************************/
 
 import processing.serial.*;
+import java.awt.Toolkit;
+import java.awt.Dimension;
 
 // ==================== 系统配置 ====================
 final int ROWS = 12;
@@ -46,6 +48,15 @@ float panX = 0;
 float panY = 0;
 final float PRESSURE_HEIGHT_MAX = 150.0; // 放大最大高度，使立体感更明显
 
+// ==================== 自适应缩放 ====================
+// 设计基准分辨率（所有布局基于此尺寸设计）
+final int REF_WIDTH = 1000;
+final int REF_HEIGHT = 800;
+// 屏幕物理分辨率（在 settings() 中检测）
+int screenW, screenH;
+// 动态内容缩放因子（每帧根据窗口大小更新）
+float contentScale = 1.0;
+
 // ==================== 全局变量 ====================
 Serial serialPort;
 
@@ -59,6 +70,10 @@ float[][] bufferData = new float[ROWS][COLS];
 boolean[] rowReceived = new boolean[ROWS];  // 标记哪些行已收到
 boolean frameInProgress = false;            // 是否正在接收一帧数据
 
+// 演示模式切换（0=高斯, 1=环形）
+int demoMode = 0;
+final int DEMO_MODE_COUNT = 2;
+
 // 帧计数器（用于显示统计）
 int frameCount = 0;
 long lastFrameTime = 0;
@@ -67,14 +82,27 @@ float fps = 0;
 // ==================== Processing 入口 ====================
 
 void settings() {
-  int windowWidth = 1000;
-  int windowHeight = 800;
+  // 检测显示器物理分辨率
+  Dimension screenSize = Toolkit.getDefaultToolkit().getScreenSize();
+  screenW = screenSize.width;
+  screenH = screenSize.height;
+
+  // 初始窗口取屏幕短边的 60%，保持 5:4 比例
+  int windowWidth  = (int)(min(screenW, screenH) * 0.60 * 1.25); // 5:4
+  int windowHeight = (int)(min(screenW, screenH) * 0.60);
   size(windowWidth, windowHeight, P3D);  // 启用 3D 渲染
   noSmooth();
 }
 
 void setup() {
   surface.setTitle("12x12 Pressure Array 3D Visualization");
+  surface.setResizable(true);
+
+  // 将窗口居中到屏幕中央
+  surface.setLocation((screenW - width) / 2, (screenH - height) / 2);
+
+  println("屏幕分辨率: " + screenW + " x " + screenH);
+  println("初始窗口: " + width + " x " + height);
 
   // 初始化数据
   initDataArrays();
@@ -94,6 +122,9 @@ void setup() {
 void draw() {
   background(30);
 
+  // 根据当前窗口大小计算内容缩放因子（取宽高中较小的比例，保证内容不溢出）
+  contentScale = min((float)width / REF_WIDTH, (float)height / REF_HEIGHT);
+
   // 处理所有待读取的串口数据
   processSerialData();
 
@@ -103,11 +134,11 @@ void draw() {
   // ----- 3D 环境绘制 -----
   pushMatrix();
 
-  // 视角变换
-  translate(width / 2.0 + panX, height / 2.0 + panY, -200);
+  // 视角变换：将 3D 场景居中于当前窗口，并叠加自适应缩放
+  translate(width / 2.0 + panX, height / 2.0 + panY, -200 * contentScale);
   rotateX(rotationX);
   rotateY(rotationY);
-  scale(zoom);
+  scale(zoom * contentScale);
 
   // 光照设置
   lights();
@@ -305,103 +336,93 @@ color pressureToColor(float pressure) {
 
 // ==================== 3D 绘图函数 ====================
 
-void drawBaseGrid() {
-  pushMatrix();
-  float w = COLS * CELL_SIZE;
-  float h = ROWS * CELL_SIZE;
-
-  // 在 Z=0 处保留参考网格线，代表压力为0的基准面
-  pushMatrix();
-  translate(0, 0, 0);
-  stroke(80);
-  strokeWeight(1);
-  for (int r = 0; r <= ROWS; r++) {
-    float y = (r - ROWS/2.0) * CELL_SIZE;
-    line(-w/2, y, 0, w/2, y, 0);
-  }
-  for (int c = 0; c <= COLS; c++) {
-    float x = (c - COLS/2.0) * CELL_SIZE;
-    line(x, -h/2, 0, x, h/2, 0);
-  }
-  popMatrix();
-
-  popMatrix();
-}
-
 float getSafePressure(int r, int c) {
   float p = displayPressureData[r][c];
   return Float.isNaN(p) ? 0 : p;
 }
 
-void drawHeatmap3D() {
-  // 1. 绘制连贯的平滑凹陷曲面 (Triangle Strip)
-  noStroke();
-  for (int r = 0; r < ROWS - 1; r++) {
-    beginShape(TRIANGLE_STRIP);
-    for (int c = 0; c < COLS; c++) {
-      // 顶点 1: 当前行
-      float p1 = getSafePressure(r, c);
-      float x1 = (c - COLS/2.0 + 0.5) * CELL_SIZE;
-      float y1 = (r - ROWS/2.0 + 0.5) * CELL_SIZE;
-      // 负号实现凹陷：压力越大，Z值越小（越向下凹）
-      float z1 = map(p1, PRESSURE_MIN, PRESSURE_MAX, 0, -PRESSURE_HEIGHT_MAX);
-      fill(pressureToColor(p1));
-      vertex(x1, y1, z1);
-
-      // 顶点 2: 下一行
-      float p2 = getSafePressure(r + 1, c);
-      float x2 = (c - COLS/2.0 + 0.5) * CELL_SIZE;
-      float y2 = (r + 1 - ROWS/2.0 + 0.5) * CELL_SIZE;
-      float z2 = map(p2, PRESSURE_MIN, PRESSURE_MAX, 0, -PRESSURE_HEIGHT_MAX);
-      fill(pressureToColor(p2));
-      vertex(x2, y2, z2);
+// 获取 13×13 格点处的插值压力值（格点位于网格交叉点，通过相邻单元格均值计算）
+float getGridPointPressure(int gr, int gc) {
+  // gr: 0~ROWS, gc: 0~COLS — 格点索引
+  // 收集该格点相邻的 1~4 个单元格的压力值取均值
+  float sum = 0;
+  int count = 0;
+  // 格点 (gr, gc) 的相邻单元格为 (gr-1,gc-1), (gr-1,gc), (gr,gc-1), (gr,gc)
+  for (int dr = -1; dr <= 0; dr++) {
+    for (int dc = -1; dc <= 0; dc++) {
+      int r = gr + dr;
+      int c = gc + dc;
+      if (r >= 0 && r < ROWS && c >= 0 && c < COLS) {
+        sum += getSafePressure(r, c);
+        count++;
+      }
     }
-    endShape();
   }
+  return (count > 0) ? sum / count : 0;
+}
 
-  // 2. 在曲面上方叠加浅色拓扑线框，增强视觉结构感
-  stroke(255, 40); // 半透明白线
+// 格点坐标转换：格点索引 → 世界坐标
+float gridPointX(int gc) { return (gc - COLS / 2.0) * CELL_SIZE; }
+float gridPointY(int gr) { return (gr - ROWS / 2.0) * CELL_SIZE; }
+float gridPointZ(float pressure) { return map(pressure, PRESSURE_MIN, PRESSURE_MAX, 0, -PRESSURE_HEIGHT_MAX); }
+
+void drawBaseGrid() {
+  // 绘制贴合曲面的 3D 网格线（13 横 + 13 纵）
+  stroke(80);
   strokeWeight(1);
   noFill();
 
-  // 横向连接线
-  for (int r = 0; r < ROWS; r++) {
-    beginShape(LINES);
-    for (int c = 0; c < COLS - 1; c++) {
-      float p1 = getSafePressure(r, c);
-      float x1 = (c - COLS/2.0 + 0.5) * CELL_SIZE;
-      float y1 = (r - ROWS/2.0 + 0.5) * CELL_SIZE;
-      float z1 = map(p1, PRESSURE_MIN, PRESSURE_MAX, 0, -PRESSURE_HEIGHT_MAX);
-
-      float p2 = getSafePressure(r, c + 1);
-      float x2 = (c + 1 - COLS/2.0 + 0.5) * CELL_SIZE;
-      float y2 = y1;
-      float z2 = map(p2, PRESSURE_MIN, PRESSURE_MAX, 0, -PRESSURE_HEIGHT_MAX);
-
-      vertex(x1, y1, z1);
-      vertex(x2, y2, z2);
+  // 横向网格线 (13 条, gr = 0 ~ ROWS)
+  for (int gr = 0; gr <= ROWS; gr++) {
+    beginShape();
+    for (int gc = 0; gc <= COLS; gc++) {
+      float p = getGridPointPressure(gr, gc);
+      vertex(gridPointX(gc), gridPointY(gr), gridPointZ(p));
     }
     endShape();
   }
 
-  // 纵向连接线
-  for (int c = 0; c < COLS; c++) {
-    beginShape(LINES);
-    for (int r = 0; r < ROWS - 1; r++) {
-      float p1 = getSafePressure(r, c);
-      float x1 = (c - COLS/2.0 + 0.5) * CELL_SIZE;
-      float y1 = (r - ROWS/2.0 + 0.5) * CELL_SIZE;
-      float z1 = map(p1, PRESSURE_MIN, PRESSURE_MAX, 0, -PRESSURE_HEIGHT_MAX);
-
-      float p2 = getSafePressure(r + 1, c);
-      float x2 = x1;
-      float y2 = (r + 1 - ROWS/2.0 + 0.5) * CELL_SIZE;
-      float z2 = map(p2, PRESSURE_MIN, PRESSURE_MAX, 0, -PRESSURE_HEIGHT_MAX);
-
-      vertex(x1, y1, z1);
-      vertex(x2, y2, z2);
+  // 纵向网格线 (13 条, gc = 0 ~ COLS)
+  for (int gc = 0; gc <= COLS; gc++) {
+    beginShape();
+    for (int gr = 0; gr <= ROWS; gr++) {
+      float p = getGridPointPressure(gr, gc);
+      vertex(gridPointX(gc), gridPointY(gr), gridPointZ(p));
     }
     endShape();
+  }
+}
+
+void drawHeatmap3D() {
+  // 逐单元格绘制：每格统一颜色，四角使用格点Z高度保持曲面形状
+  noStroke();
+  for (int r = 0; r < ROWS; r++) {
+    for (int c = 0; c < COLS; c++) {
+      // 该单元格的统一颜色
+      fill(pressureToColor(getSafePressure(r, c)));
+
+      // 四角格点的 Z 高度（保持曲面凹陷）
+      float z00 = gridPointZ(getGridPointPressure(r,     c    ));
+      float z01 = gridPointZ(getGridPointPressure(r,     c + 1));
+      float z10 = gridPointZ(getGridPointPressure(r + 1, c    ));
+      float z11 = gridPointZ(getGridPointPressure(r + 1, c + 1));
+
+      float x0 = gridPointX(c);
+      float x1 = gridPointX(c + 1);
+      float y0 = gridPointY(r);
+      float y1 = gridPointY(r + 1);
+
+      // 两个三角形拼成一个单元格
+      beginShape(TRIANGLES);
+      vertex(x0, y0, z00);
+      vertex(x1, y0, z01);
+      vertex(x0, y1, z10);
+
+      vertex(x1, y0, z01);
+      vertex(x1, y1, z11);
+      vertex(x0, y1, z10);
+      endShape();
+    }
   }
 }
 
@@ -435,28 +456,31 @@ void drawLabels3D() {
 // ==================== 2D UI 函数 ====================
 
 void drawColorLegend() {
-  float legendX = width - LEGEND_WIDTH - PADDING;
-  float legendH = 300;
+  float s = contentScale; // 缩放因子
+  float lw = LEGEND_WIDTH * s;
+  float pad = PADDING * s;
+  float legendX = width - lw - pad;
+  float legendH = 300 * s;
   float legendY = (height - legendH) / 2.0; // 垂直居中
 
   // 绘制渐变色条
-  int steps = (int) legendH;
+  int steps = max((int) legendH, 1);
   for (int i = 0; i < steps; i++) {
     float pressure = map(i, 0, steps - 1, PRESSURE_MAX, PRESSURE_MIN);
     color c = pressureToColor(pressure);
     stroke(c);
-    line(legendX, legendY + i, legendX + LEGEND_WIDTH, legendY + i);
+    line(legendX, legendY + i, legendX + lw, legendY + i);
   }
 
   // 色条边框
   noFill();
   stroke(120);
   strokeWeight(1);
-  rect(legendX, legendY, LEGEND_WIDTH, legendH);
+  rect(legendX, legendY, lw, legendH);
 
   // 数值刻度
   fill(200);
-  textSize(12);
+  textSize(12 * s);
   textAlign(LEFT, CENTER);
   int numTicks = 6;
   for (int i = 0; i <= numTicks; i++) {
@@ -464,36 +488,39 @@ void drawColorLegend() {
     float y = map(i, 0, numTicks, legendY, legendY + legendH);
 
     stroke(200);
-    line(legendX + LEGEND_WIDTH, y, legendX + LEGEND_WIDTH + 4, y);
+    line(legendX + lw, y, legendX + lw + 4 * s, y);
 
     noStroke();
-    text(nf(val, 0, 0), legendX + LEGEND_WIDTH + 8, y);
+    text(nf(val, 0, 0), legendX + lw + 8 * s, y);
   }
 
   // 标题
   textAlign(CENTER, BOTTOM);
-  textSize(12);
+  textSize(12 * s);
   fill(200);
-  text("Pressure", legendX + LEGEND_WIDTH / 2, legendY - 8);
+  text("Pressure", legendX + lw / 2, legendY - 8 * s);
 
   textAlign(CENTER, CENTER);
 }
 
 void drawStatusBar() {
+  float s = contentScale;
   fill(150);
-  textSize(12);
+  textSize(12 * s);
   textAlign(LEFT, BOTTOM);
 
   String status = "Serial: " + (serialPort != null ? "Connected" : "Disconnected");
   status += "  |  Data FPS: " + nf(fps, 0, 1);
   status += "  |  Range: " + nf(PRESSURE_MIN, 0, 0) + " ~ " + nf(PRESSURE_MAX, 0, 0);
+  status += "  |  Window: " + width + "x" + height;
 
-  text(status, 20, height - 20);
+  text(status, 20 * s, height - 20 * s);
 }
 
 void drawInstructions() {
+  float s = contentScale;
   fill(180);
-  textSize(12);
+  textSize(12 * s);
   textAlign(LEFT, TOP);
   String ins = "CONTROLS:\n";
   ins += "[Left Click Drag] Rotate\n";
@@ -502,7 +529,7 @@ void drawInstructions() {
   ins += "[D] Fill Demo Data\n";
   ins += "[R] Reset View & Data\n";
   ins += "[S] Screenshot";
-  text(ins, 20, 20);
+  text(ins, 20 * s, 20 * s);
 }
 
 // ==================== 鼠标交互 ====================
@@ -550,16 +577,37 @@ void keyPressed() {
 void fillDemoData() {
   float centerR = ROWS / 2.0;
   float centerC = COLS / 2.0;
-  float sigma = 3.0;
 
-  for (int r = 0; r < ROWS; r++) {
-    for (int c = 0; c < COLS; c++) {
-      float dr = r - centerR;
-      float dc = c - centerC;
-      float dist2 = dr * dr + dc * dc;
-      pressureData[r][c] = PRESSURE_MAX * exp(-dist2 / (2 * sigma * sigma));
-      pressureData[r][c] += random(-1, 1);
-      pressureData[r][c] = constrain(pressureData[r][c], PRESSURE_MIN, PRESSURE_MAX);
+  if (demoMode == 0) {
+    // 高斯分布：中心最大，向外衰减
+    float sigma = 3.0;
+    for (int r = 0; r < ROWS; r++) {
+      for (int c = 0; c < COLS; c++) {
+        float dr = r - centerR;
+        float dc = c - centerC;
+        float dist2 = dr * dr + dc * dc;
+        pressureData[r][c] = PRESSURE_MAX * exp(-dist2 / (2 * sigma * sigma));
+        pressureData[r][c] += random(-1, 1);
+        pressureData[r][c] = constrain(pressureData[r][c], PRESSURE_MIN, PRESSURE_MAX);
+      }
+    }
+  } else if (demoMode == 1) {
+    // 环形分布：压力集中在半径 ringR 附近的环带，中心和边缘较低
+    float ringR = 3.5;    // 环的半径（单元格数）
+    float ringW = 1.8;    // 环的宽度（控制衰减）
+    for (int r = 0; r < ROWS; r++) {
+      for (int c = 0; c < COLS; c++) {
+        float dr = r - centerR;
+        float dc = c - centerC;
+        float dist = sqrt(dr * dr + dc * dc);
+        float deviation = dist - ringR;
+        pressureData[r][c] = PRESSURE_MAX * exp(-(deviation * deviation) / (2 * ringW * ringW));
+        pressureData[r][c] += random(-1, 1);
+        pressureData[r][c] = constrain(pressureData[r][c], PRESSURE_MIN, PRESSURE_MAX);
+      }
     }
   }
+
+  // 切换到下一个模式
+  demoMode = (demoMode + 1) % DEMO_MODE_COUNT;
 }
