@@ -60,15 +60,16 @@ float fps = 0;
 
 // ==================== Processing 入口 ====================
 
-void setup() {
+void settings() {
   // 窗口大小 = 网格 + 留白 + 色条图例
-  // 宽度：左留白 + 12格 + 右留白 + 色条区域
-  // 高度：上留白 + 12格 + 下留白
   int windowWidth  = PADDING + COLS * CELL_SIZE + LEGEND_GAP + LEGEND_WIDTH + PADDING;
   int windowHeight = PADDING + ROWS * CELL_SIZE + PADDING;
+  size(windowWidth, windowHeight);
+  // 关闭抗锯齿，确保 1px 线条在所有位置渲染一致
+  noSmooth();
+}
 
-  // Processing 4.x 中 size() 必须使用字面常量，所以改用 surface
-  surface.setSize(windowWidth, windowHeight);
+void setup() {
   surface.setTitle("12x12 Pressure Array Heatmap");
 
   // 初始化数据为 NaN（无效）
@@ -82,7 +83,7 @@ void setup() {
   textSize(12);
 
   println("=== 可视化系统就绪 ===");
-  println("窗口大小: " + windowWidth + " x " + windowHeight);
+  println("窗口大小: " + width + " x " + height);
   println("压力范围: " + PRESSURE_MIN + " ~ " + PRESSURE_MAX);
 }
 
@@ -330,35 +331,54 @@ color pressureToColor(float pressure) {
  * 每个方格根据对应压力值着色，并在方格内显示数值。
  */
 void drawHeatmap() {
-  float gridStartX = PADDING;
-  float gridStartY = PADDING;
+  int gridStartX = PADDING;
+  int gridStartY = PADDING;
 
+  // 第一遍：绘制填充方格（无边框，无圆角，纯整数坐标）
+  noStroke();
   for (int r = 0; r < ROWS; r++) {
     for (int c = 0; c < COLS; c++) {
-      float x = gridStartX + c * CELL_SIZE;
-      float y = gridStartY + r * CELL_SIZE;
+      int x = gridStartX + c * CELL_SIZE;
+      int y = gridStartY + r * CELL_SIZE;
 
-      // 获取颜色
       color cellColor = pressureToColor(pressureData[r][c]);
-
-      // 绘制方格
       fill(cellColor);
-      stroke(60);           // 深灰色边框
-      strokeWeight(1.5);
-      rect(x, y, CELL_SIZE, CELL_SIZE, 3);  // 圆角矩形
+      rect(x, y, CELL_SIZE, CELL_SIZE);
+    }
+  }
 
-      // 在方格内显示数值
+  // 第二遍：统一绘制网格线（整数坐标 + 整数线宽 + 无抗锯齿 = 像素精确）
+  stroke(60, 60, 60, 255);
+  strokeWeight(1);
+  strokeCap(SQUARE);
+  strokeJoin(MITER);
+  noFill();
+  // 水平线
+  for (int r = 0; r <= ROWS; r++) {
+    int y = gridStartY + r * CELL_SIZE;
+    line(gridStartX, y, gridStartX + COLS * CELL_SIZE, y);
+  }
+  // 垂直线
+  for (int c = 0; c <= COLS; c++) {
+    int x = gridStartX + c * CELL_SIZE;
+    line(x, gridStartY, x, gridStartY + ROWS * CELL_SIZE);
+  }
+
+  // 第三遍：绘制方格内数值
+  noStroke();
+  for (int r = 0; r < ROWS; r++) {
+    for (int c = 0; c < COLS; c++) {
+      int x = gridStartX + c * CELL_SIZE;
+      int y = gridStartY + r * CELL_SIZE;
+
       if (!Float.isNaN(pressureData[r][c])) {
-        // 根据背景明暗选择文字颜色
+        color cellColor = pressureToColor(pressureData[r][c]);
         float brightness_val = brightness(cellColor);
-        fill(brightness_val > 50 ? 0 : 255);  // 亮背景用黑字，暗背景用白字
-        noStroke();
+        fill(brightness_val > 50 ? 0 : 255);
         textSize(11);
         text(nf(pressureData[r][c], 0, 1), x + CELL_SIZE / 2, y + CELL_SIZE / 2);
       } else {
-        // 无效数据显示 "---"
         fill(180);
-        noStroke();
         textSize(10);
         text("---", x + CELL_SIZE / 2, y + CELL_SIZE / 2);
       }
