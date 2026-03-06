@@ -1,12 +1,13 @@
 /***************************************************************
- * 项目：12x12 压力传感阵列 - 实时热力图可视化
+ * 项目：12x12 压力传感阵列 - 3D 实时热力图可视化
  * 平台：Processing 4.x
  * 依赖：Processing Serial Library (内置，无需额外安装)
  *
  * 功能：
  *   - 通过串口接收 Arduino/Teensy 发送的 12x12 矩阵数据
- *   - 将压力数值实时转化为热力图 (绿色 -> 红色)
- *   - 缺失/无效数据显示为白色
+ *   - 将压力数值实时转化为 3D 立体柱状图和表面网格
+ *   - 支持鼠标拖拽旋转、滚轮缩放、方向键平移
+ *   - 支持平滑动画缓动，显示状态信息与色条
  *
  * 数据协议：
  *   Arduino 端以 "R01\t值1\t值2\t...\t值12" 格式逐行输出
@@ -24,29 +25,34 @@ final float PRESSURE_MIN = 0.0;
 final float PRESSURE_MAX = 30.0;
 
 // 电压 -> 压力 的线性映射参数
-// Arduino 输出电压范围 0~3.3V，对应压力 0~30
-// 如果 Arduino 直接输出压力值，将这两个值设为与 PRESSURE 相同即可
 final float VOLTAGE_MIN = 0.0;
 final float VOLTAGE_MAX = 3.3;
 
 // 网格绘制参数
 final int CELL_SIZE = 50;          // 每个方格的像素大小
 final int PADDING = 60;            // 画布四周留白
-final int LABEL_OFFSET = 15;       // 行/列标签偏移量
 final int LEGEND_WIDTH = 30;       // 色条图例宽度
 final int LEGEND_GAP = 30;         // 色条与网格的间距
 
 // 串口配置
 final int BAUD_RATE = 115200;
-// 如果需要指定串口名称，在此修改；留空则自动选择第一个可用串口
 String SERIAL_PORT_NAME = "";
+
+// ==================== 3D 视角控制 ====================
+float rotationX = 1.0;
+float rotationY = 0.0;
+float zoom = 1.0;
+float panX = 0;
+float panY = 0;
+final float PRESSURE_HEIGHT_MAX = 150.0; // 放大最大高度，使立体感更明显
 
 // ==================== 全局变量 ====================
 Serial serialPort;
 
-// 数据矩阵：存储当前帧的压力值
-// NaN 表示该点数据无效/缺失 -> 绘制为白色
+// 数据矩阵：存储当前帧的压力真实值
 float[][] pressureData = new float[ROWS][COLS];
+// 用于平滑动画的显示数据矩阵（缓动插值）
+float[][] displayPressureData = new float[ROWS][COLS];
 
 // 临时缓冲区：在接收完整帧期间暂存数据
 float[][] bufferData = new float[ROWS][COLS];
@@ -61,18 +67,16 @@ float fps = 0;
 // ==================== Processing 入口 ====================
 
 void settings() {
-  // 窗口大小 = 网格 + 留白 + 色条图例
-  int windowWidth  = PADDING + COLS * CELL_SIZE + LEGEND_GAP + LEGEND_WIDTH + PADDING;
-  int windowHeight = PADDING + ROWS * CELL_SIZE + PADDING;
-  size(windowWidth, windowHeight);
-  // 关闭抗锯齿，确保 1px 线条在所有位置渲染一致
+  int windowWidth = 1000;
+  int windowHeight = 800;
+  size(windowWidth, windowHeight, P3D);  // 启用 3D 渲染
   noSmooth();
 }
 
 void setup() {
-  surface.setTitle("12x12 Pressure Array Heatmap");
+  surface.setTitle("12x12 Pressure Array 3D Visualization");
 
-  // 初始化数据为 NaN（无效）
+  // 初始化数据
   initDataArrays();
 
   // 初始化串口
@@ -82,33 +86,81 @@ void setup() {
   textAlign(CENTER, CENTER);
   textSize(12);
 
-  println("=== 可视化系统就绪 ===");
+  println("=== 3D可视化系统就绪 ===");
   println("窗口大小: " + width + " x " + height);
   println("压力范围: " + PRESSURE_MIN + " ~ " + PRESSURE_MAX);
 }
 
 void draw() {
-  background(40);  // 深灰色背景
+  background(30);
 
   // 处理所有待读取的串口数据
   processSerialData();
 
-  // 绘制网格热力图
-  drawHeatmap();
+  // 平滑插值更新显示数据
+  updateDisplayData();
 
-  // 绘制色条图例
+  // ----- 3D 环境绘制 -----
+  pushMatrix();
+
+  // 视角变换
+  translate(width / 2.0 + panX, height / 2.0 + panY, -200);
+  rotateX(rotationX);
+  rotateY(rotationY);
+  scale(zoom);
+
+  // 光照设置
+  lights();
+  directionalLight(255, 255, 255, 0.5, 0.5, -1);
+  ambientLight(100, 100, 100);
+
+  // 绘制基面网格
+  drawBaseGrid();
+
+  // 绘制 3D 柱体和表面网格
+  drawHeatmap3D();
+
+  // 绘制行列标签
+  drawLabels3D();
+
+  popMatrix();
+
+  // ----- 2D UI 绘制 -----
+  hint(DISABLE_DEPTH_TEST);
+  camera();      // 重置相机
+  noLights();    // 关闭光照
+
   drawColorLegend();
-
-  // 绘制状态信息
   drawStatusBar();
+  drawInstructions();
+
+  hint(ENABLE_DEPTH_TEST);
 }
 
-// ==================== 数据初始化 ====================
+// ==================== 数据更新与插值 ====================
+
+void updateDisplayData() {
+  // 动画缓动：让显示的数据平滑过渡到目标真实数据
+  float lerpFactor = 0.2; // 插值系数，调节过渡速度
+  for (int r = 0; r < ROWS; r++) {
+    for (int c = 0; c < COLS; c++) {
+      float target = pressureData[r][c];
+      if (Float.isNaN(target)) target = 0; // 无效数据当0处理
+
+      if (Float.isNaN(displayPressureData[r][c])) {
+        displayPressureData[r][c] = target;
+      } else {
+        displayPressureData[r][c] = lerp(displayPressureData[r][c], target, lerpFactor);
+      }
+    }
+  }
+}
 
 void initDataArrays() {
   for (int r = 0; r < ROWS; r++) {
     for (int c = 0; c < COLS; c++) {
       pressureData[r][c] = Float.NaN;
+      displayPressureData[r][c] = Float.NaN;
       bufferData[r][c]   = Float.NaN;
     }
     rowReceived[r] = false;
@@ -133,13 +185,12 @@ void initSerial() {
   if (SERIAL_PORT_NAME.length() > 0) {
     portName = SERIAL_PORT_NAME;
   } else {
-    // 自动选择最后一个串口（通常是最新连接的设备）
     portName = portList[portList.length - 1];
   }
 
   try {
     serialPort = new Serial(this, portName, BAUD_RATE);
-    serialPort.bufferUntil('\n');  // 按行缓冲
+    serialPort.bufferUntil('\n');
     println("已连接串口: " + portName + " @ " + BAUD_RATE + " baud");
   } catch (Exception e) {
     println("[错误] 无法打开串口 " + portName + ": " + e.getMessage());
@@ -149,13 +200,6 @@ void initSerial() {
 
 // ==================== 串口数据处理 ====================
 
-/**
- * 持续读取并解析串口缓冲区中的所有数据行。
- * 数据协议:
- *   - "=== 12x12" 开头 -> 新帧开始
- *   - "====" 开头 (不含 "12x12") -> 当前帧结束，提交数据
- *   - "R01\t..." ~ "R12\t..." -> 行数据
- */
 void processSerialData() {
   if (serialPort == null) return;
 
@@ -166,9 +210,7 @@ void processSerialData() {
     line = line.trim();
     if (line.length() == 0) continue;
 
-    // 检测帧起始标记: "=== 12x12 矩阵 ..."
     if (line.startsWith("=== 12x12")) {
-      // 新帧开始，重置缓冲区
       frameInProgress = true;
       for (int r = 0; r < ROWS; r++) {
         for (int c = 0; c < COLS; c++) {
@@ -179,60 +221,44 @@ void processSerialData() {
       continue;
     }
 
-    // 检测帧结束标记: "========================"
     if (line.startsWith("====") && !line.contains("12x12")) {
       if (frameInProgress) {
-        // 将缓冲区数据提交到显示数据
         commitFrame();
         frameInProgress = false;
       }
       continue;
     }
 
-    // 解析行数据: "R01\t 0.12\t 0.34\t..."
     if (frameInProgress && line.startsWith("R")) {
       parseRowData(line);
     }
   }
 }
 
-/**
- * 解析一行数据，格式: "R01\t值1\t值2\t...\t值12"
- * 行号从 R01 到 R12
- */
 void parseRowData(String line) {
   String[] parts = line.split("\t");
   if (parts.length < 2) return;
 
-  // 提取行号: "R01" -> 0, "R12" -> 11
   String rowStr = parts[0].trim();
   if (rowStr.length() < 2) return;
 
   int rowIndex;
   try {
-    rowIndex = Integer.parseInt(rowStr.substring(1)) - 1;  // "R01" -> 0
+    rowIndex = Integer.parseInt(rowStr.substring(1)) - 1;
   } catch (NumberFormatException e) {
-    return;  // 无效行号
+    return;
   }
 
   if (rowIndex < 0 || rowIndex >= ROWS) return;
 
-  // 解析该行的每个数值
   for (int c = 0; c < COLS && c + 1 < parts.length; c++) {
     String valStr = parts[c + 1].trim();
     try {
       float voltage = Float.parseFloat(valStr);
-
-      // ---- 电压 -> 压力 线性映射 ----
-      // 将 Arduino 输出的电压值映射到压力范围
       float pressure = map(voltage, VOLTAGE_MIN, VOLTAGE_MAX, PRESSURE_MIN, PRESSURE_MAX);
-
-      // 钳位到有效范围
       pressure = constrain(pressure, PRESSURE_MIN, PRESSURE_MAX);
-
       bufferData[rowIndex][c] = pressure;
     } catch (NumberFormatException e) {
-      // 解析失败，保持 NaN（将显示为白色）
       bufferData[rowIndex][c] = Float.NaN;
     }
   }
@@ -240,10 +266,6 @@ void parseRowData(String line) {
   rowReceived[rowIndex] = true;
 }
 
-/**
- * 将缓冲区中的完整帧数据提交到显示矩阵。
- * 未收到的行保留 NaN，绘制时显示为白色。
- */
 void commitFrame() {
   for (int r = 0; r < ROWS; r++) {
     for (int c = 0; c < COLS; c++) {
@@ -251,7 +273,6 @@ void commitFrame() {
     }
   }
 
-  // 更新帧率统计
   frameCount++;
   long now = millis();
   if (now - lastFrameTime > 1000) {
@@ -263,60 +284,18 @@ void commitFrame() {
 
 // ==================== 颜色映射 ====================
 
-/**
- * 核心颜色映射函数：将压力值映射为热力图颜色。
- *
- * 【颜色映射逻辑 - colorMode(HSB)】
- *
- * 使用 HSB (色相-饱和度-明度) 颜色模式：
- *   - H (Hue 色相): 0~360 度
- *       绿色 = 120 度, 红色 = 0 度
- *       压力 0 -> H=120 (绿), 压力 30 -> H=0 (红)
- *       使用 map() 将 [0, 30] 线性映射到 [120, 0]（注意是反向映射）
- *
- *   - S (Saturation 饱和度): 0~100%
- *       低压时饱和度低(颜色淡/浅), 高压时饱和度高(颜色浓/深)
- *       使用 map() 将 [0, 30] 映射到 [25, 100]
- *       最低 25% 保留一定底色，避免完全变白
- *
- *   - B (Brightness 明度): 0~100%
- *       低压时高亮度(颜色亮/浅), 高压时适中亮度(颜色深沉)
- *       使用 map() 将 [0, 30] 映射到 [100, 70]（注意是反向映射）
- *       高压端保持 70% 明度，保证红色深沉但不至于全黑
- *
- * 综合效果：
- *   压力=0  -> 极浅淡绿色 (H=120, S=25, B=100)
- *   压力=15 -> 中等饱和的黄色 (H=60, S=62, B=85)
- *   压力=30 -> 深沉浓郁的红色 (H=0, S=100, B=70)
- *
- * @param pressure 压力值 (0~30)
- * @return Processing color 对象
- */
 color pressureToColor(float pressure) {
-  // 无效数据 -> 纯白色
   if (Float.isNaN(pressure)) {
     return color(255, 255, 255);
   }
 
-  // 确保在有效范围内
   pressure = constrain(pressure, PRESSURE_MIN, PRESSURE_MAX);
-
-  // 归一化到 0.0 ~ 1.0
   float t = map(pressure, PRESSURE_MIN, PRESSURE_MAX, 0.0, 1.0);
 
-  // --- 色相 (Hue): 绿(120) -> 红(0)，线性反向映射 ---
-  // map(t, 0, 1, 120, 0) 等价于 120 * (1 - t)
   float h = map(t, 0.0, 1.0, 120.0, 0.0);
-
-  // --- 饱和度 (Saturation): 低压淡(25%) -> 高压浓(100%) ---
-  // 低压时颜色接近白色/淡色，高压时颜色饱满浓郁
   float s = map(t, 0.0, 1.0, 25.0, 100.0);
-
-  // --- 明度 (Brightness): 低压亮(100%) -> 高压暗(70%) ---
-  // 使低压区域呈现浅亮的淡绿色，高压区域呈现深沉的红色
   float b = map(t, 0.0, 1.0, 100.0, 70.0);
 
-  // 切换到 HSB 模式计算颜色，然后切回 RGB
   colorMode(HSB, 360, 100, 100);
   color c = color(h, s, b);
   colorMode(RGB, 255);
@@ -324,99 +303,144 @@ color pressureToColor(float pressure) {
   return c;
 }
 
-// ==================== 绘图函数 ====================
+// ==================== 3D 绘图函数 ====================
 
-/**
- * 绘制 12x12 热力图网格。
- * 每个方格根据对应压力值着色，并在方格内显示数值。
- */
-void drawHeatmap() {
-  int gridStartX = PADDING;
-  int gridStartY = PADDING;
+void drawBaseGrid() {
+  pushMatrix();
+  float w = COLS * CELL_SIZE;
+  float h = ROWS * CELL_SIZE;
 
-  // 第一遍：绘制填充方格（无边框，无圆角，纯整数坐标）
+  translate(0, 0, -1); // 稍微下移避免与柱体底部产生 Z-fighting
+
+  // 绘制深色底板
+  fill(45);
   noStroke();
+  rectMode(CENTER);
+  rect(0, 0, w + 20, h + 20);
+  rectMode(CORNER);
+
+  // 绘制网格线
+  stroke(80);
+  strokeWeight(1);
+  for (int r = 0; r <= ROWS; r++) {
+    float y = (r - ROWS/2.0) * CELL_SIZE;
+    line(-w/2, y, 0, w/2, y, 0);
+  }
+  for (int c = 0; c <= COLS; c++) {
+    float x = (c - COLS/2.0) * CELL_SIZE;
+    line(x, -h/2, 0, x, h/2, 0);
+  }
+  popMatrix();
+}
+
+void drawHeatmap3D() {
+  // 1. 绘制柱体与数值
   for (int r = 0; r < ROWS; r++) {
     for (int c = 0; c < COLS; c++) {
-      int x = gridStartX + c * CELL_SIZE;
-      int y = gridStartY + r * CELL_SIZE;
-
-      color cellColor = pressureToColor(pressureData[r][c]);
-      fill(cellColor);
-      rect(x, y, CELL_SIZE, CELL_SIZE);
+      drawCell3D(r, c, displayPressureData[r][c]);
     }
   }
 
-  // 第二遍：统一绘制网格线（整数坐标 + 整数线宽 + 无抗锯齿 = 像素精确）
-  stroke(60, 60, 60, 255);
-  strokeWeight(1);
-  strokeCap(SQUARE);
-  strokeJoin(MITER);
+  // 2. 绘制表面网格（增强效果）
   noFill();
-  // 水平线
-  for (int r = 0; r <= ROWS; r++) {
-    int y = gridStartY + r * CELL_SIZE;
-    line(gridStartX, y, gridStartX + COLS * CELL_SIZE, y);
-  }
-  // 垂直线
-  for (int c = 0; c <= COLS; c++) {
-    int x = gridStartX + c * CELL_SIZE;
-    line(x, gridStartY, x, gridStartY + ROWS * CELL_SIZE);
-  }
-
-  // 第三遍：绘制方格内数值
-  noStroke();
+  stroke(255, 120);
+  strokeWeight(1.5);
+  beginShape(LINES);
   for (int r = 0; r < ROWS; r++) {
     for (int c = 0; c < COLS; c++) {
-      int x = gridStartX + c * CELL_SIZE;
-      int y = gridStartY + r * CELL_SIZE;
+      float x1 = (c - COLS/2.0 + 0.5) * CELL_SIZE;
+      float y1 = (r - ROWS/2.0 + 0.5) * CELL_SIZE;
+      float p1 = displayPressureData[r][c];
+      float h1 = map(p1, PRESSURE_MIN, PRESSURE_MAX, 0, PRESSURE_HEIGHT_MAX);
 
-      if (!Float.isNaN(pressureData[r][c])) {
-        color cellColor = pressureToColor(pressureData[r][c]);
-        float brightness_val = brightness(cellColor);
-        fill(brightness_val > 50 ? 0 : 255);
-        textSize(11);
-        text(nf(pressureData[r][c], 0, 1), x + CELL_SIZE / 2, y + CELL_SIZE / 2);
-      } else {
-        fill(180);
-        textSize(10);
-        text("---", x + CELL_SIZE / 2, y + CELL_SIZE / 2);
+      // 连接右边节点
+      if (c < COLS - 1) {
+        float x2 = (c + 1 - COLS/2.0 + 0.5) * CELL_SIZE;
+        float p2 = displayPressureData[r][c+1];
+        float h2 = map(p2, PRESSURE_MIN, PRESSURE_MAX, 0, PRESSURE_HEIGHT_MAX);
+        vertex(x1, y1, h1);
+        vertex(x2, y1, h2);
+      }
+      // 连接下边节点
+      if (r < ROWS - 1) {
+        float y2 = (r + 1 - ROWS/2.0 + 0.5) * CELL_SIZE;
+        float p2 = displayPressureData[r+1][c];
+        float h2 = map(p2, PRESSURE_MIN, PRESSURE_MAX, 0, PRESSURE_HEIGHT_MAX);
+        vertex(x1, y1, h1);
+        vertex(x1, y2, h2);
       }
     }
   }
+  endShape();
+}
+
+void drawCell3D(int r, int c, float pressure) {
+  if (Float.isNaN(pressure) || pressure <= 0.1) return; // 忽略微小压力和无效数据
+
+  float x = (c - COLS/2.0 + 0.5) * CELL_SIZE;
+  float y = (r - ROWS/2.0 + 0.5) * CELL_SIZE;
+  float boxH = map(pressure, PRESSURE_MIN, PRESSURE_MAX, 0, PRESSURE_HEIGHT_MAX);
+
+  color cellColor = pressureToColor(pressure);
+
+  pushMatrix();
+  translate(x, y, boxH / 2.0); // box的绘制锚点在中心
+
+  fill(cellColor);
+  noStroke(); // 无边框避免视觉杂乱
+  box(CELL_SIZE - 4, CELL_SIZE - 4, boxH);
+
+  popMatrix();
+
+  // 在柱体上方绘制数值标签
+  if (pressure > 2.0) { // 压力大于一定值才显示，避免拥挤
+    pushMatrix();
+    translate(x, y, boxH + 2);
+    fill(255);
+    textSize(11);
+    textAlign(CENTER, CENTER);
+    text(nf(pressure, 0, 1), 0, 0);
+    popMatrix();
+  }
+}
+
+void drawLabels3D() {
+  fill(200);
+  textSize(14);
+  textAlign(CENTER, CENTER);
+
+  float w = COLS * CELL_SIZE;
+  float h = ROWS * CELL_SIZE;
 
   // 绘制行标签 (R01 ~ R12)
-  fill(200);
-  textSize(11);
-  textAlign(RIGHT, CENTER);
   for (int r = 0; r < ROWS; r++) {
-    float y = gridStartY + r * CELL_SIZE + CELL_SIZE / 2;
-    text("R" + nf(r + 1, 2), gridStartX - 8, y);
+    float y = (r - ROWS/2.0 + 0.5) * CELL_SIZE;
+    pushMatrix();
+    translate(-w/2 - 25, y, 0);
+    text("R" + nf(r + 1, 2), 0, 0);
+    popMatrix();
   }
 
   // 绘制列标签 (C01 ~ C12)
-  textAlign(CENTER, BOTTOM);
   for (int c = 0; c < COLS; c++) {
-    float x = gridStartX + c * CELL_SIZE + CELL_SIZE / 2;
-    text("C" + nf(c + 1, 2), x, gridStartY - 5);
+    float x = (c - COLS/2.0 + 0.5) * CELL_SIZE;
+    pushMatrix();
+    translate(x, -h/2 - 25, 0);
+    text("C" + nf(c + 1, 2), 0, 0);
+    popMatrix();
   }
-
-  // 恢复默认对齐
-  textAlign(CENTER, CENTER);
 }
 
-/**
- * 在网格右侧绘制垂直色条图例，显示压力值与颜色的对应关系。
- */
+// ==================== 2D UI 函数 ====================
+
 void drawColorLegend() {
-  float legendX = PADDING + COLS * CELL_SIZE + LEGEND_GAP;
-  float legendY = PADDING;
-  float legendH = ROWS * CELL_SIZE;
+  float legendX = width - LEGEND_WIDTH - PADDING;
+  float legendH = 300;
+  float legendY = (height - legendH) / 2.0; // 垂直居中
 
   // 绘制渐变色条
   int steps = (int) legendH;
   for (int i = 0; i < steps; i++) {
-    // 从顶部(高压/红色)到底部(低压/绿色)
     float pressure = map(i, 0, steps - 1, PRESSURE_MAX, PRESSURE_MIN);
     color c = pressureToColor(pressure);
     stroke(c);
@@ -429,92 +453,99 @@ void drawColorLegend() {
   strokeWeight(1);
   rect(legendX, legendY, LEGEND_WIDTH, legendH);
 
-  // 标注数值刻度
+  // 数值刻度
   fill(200);
-  textSize(10);
+  textSize(12);
   textAlign(LEFT, CENTER);
-  int numTicks = 6;  // 0, 6, 12, 18, 24, 30
+  int numTicks = 6;
   for (int i = 0; i <= numTicks; i++) {
     float val = map(i, 0, numTicks, PRESSURE_MAX, PRESSURE_MIN);
     float y = map(i, 0, numTicks, legendY, legendY + legendH);
 
-    // 刻度线
     stroke(200);
-    strokeWeight(1);
     line(legendX + LEGEND_WIDTH, y, legendX + LEGEND_WIDTH + 4, y);
 
-    // 数值标签
     noStroke();
     text(nf(val, 0, 0), legendX + LEGEND_WIDTH + 8, y);
   }
 
-  // 图例标题
+  // 标题
   textAlign(CENTER, BOTTOM);
-  textSize(11);
+  textSize(12);
   fill(200);
   text("Pressure", legendX + LEGEND_WIDTH / 2, legendY - 8);
 
-  // 恢复
   textAlign(CENTER, CENTER);
 }
 
-/**
- * 在窗口底部绘制状态信息。
- */
 void drawStatusBar() {
-  float statusY = PADDING + ROWS * CELL_SIZE + 15;
-
   fill(150);
-  textSize(10);
-  textAlign(LEFT, TOP);
+  textSize(12);
+  textAlign(LEFT, BOTTOM);
 
   String status = "Serial: " + (serialPort != null ? "Connected" : "Disconnected");
   status += "  |  Data FPS: " + nf(fps, 0, 1);
   status += "  |  Range: " + nf(PRESSURE_MIN, 0, 0) + " ~ " + nf(PRESSURE_MAX, 0, 0);
 
-  text(status, PADDING, statusY);
-
-  textAlign(CENTER, CENTER);
+  text(status, 20, height - 20);
 }
 
-// ==================== Processing serialEvent ====================
+void drawInstructions() {
+  fill(180);
+  textSize(12);
+  textAlign(LEFT, TOP);
+  String ins = "CONTROLS:\n";
+  ins += "[Left Click Drag] Rotate\n";
+  ins += "[Mouse Wheel] Zoom\n";
+  ins += "[Arrow Keys] Pan\n";
+  ins += "[D] Fill Demo Data\n";
+  ins += "[R] Reset View & Data\n";
+  ins += "[S] Screenshot";
+  text(ins, 20, 20);
+}
 
-/**
- * Processing 的串口事件回调（备用）。
- * 主要数据处理已在 draw() 中的 processSerialData() 完成，
- * 此回调作为额外的触发机制。
- */
-void serialEvent(Serial port) {
-  // 数据由 processSerialData() 在 draw() 中统一处理
-  // 此处留空，避免重复处理
+// ==================== 鼠标交互 ====================
+
+void mouseDragged() {
+  if (mouseButton == LEFT) {
+    rotationX += (mouseY - pmouseY) * -0.01;
+    rotationY += (mouseX - pmouseX) * 0.01;
+  }
+}
+
+void mouseWheel(MouseEvent event) {
+  zoom *= pow(1.1, -event.getCount());
 }
 
 // ==================== 键盘交互 ====================
 
 void keyPressed() {
-  // 按 'R' 重置所有数据为无效状态
-  if (key == 'r' || key == 'R') {
-    initDataArrays();
-    println("数据已重置");
-  }
-
-  // 按 'D' 填充演示数据（用于无串口时测试）
-  if (key == 'd' || key == 'D') {
-    fillDemoData();
-    println("已填充演示数据");
-  }
-
-  // 按 'S' 保存当前帧为截图
-  if (key == 's' || key == 'S') {
-    saveFrame("heatmap_####.png");
-    println("截图已保存");
+  // 方向键控制平移
+  if (key == CODED) {
+    if (keyCode == UP) panY += 20;
+    if (keyCode == DOWN) panY -= 20;
+    if (keyCode == LEFT) panX += 20;
+    if (keyCode == RIGHT) panX -= 20;
+  } else {
+    // 按 'R' 重置
+    if (key == 'r' || key == 'R') {
+      initDataArrays();
+      panX = 0; panY = 0; zoom = 1.0; rotationX = 1.0; rotationY = 0.0;
+      println("数据和视角已重置");
+    }
+    // 按 'D' 生成演示数据
+    if (key == 'd' || key == 'D') {
+      fillDemoData();
+      println("已填充演示数据");
+    }
+    // 按 'S' 截图
+    if (key == 's' || key == 'S') {
+      saveFrame("heatmap_####.png");
+      println("截图已保存");
+    }
   }
 }
 
-/**
- * 填充演示数据，用于在无串口连接时测试可视化效果。
- * 生成一个从中心向外扩散的高斯分布压力场。
- */
 void fillDemoData() {
   float centerR = ROWS / 2.0;
   float centerC = COLS / 2.0;
@@ -525,7 +556,6 @@ void fillDemoData() {
       float dr = r - centerR;
       float dc = c - centerC;
       float dist2 = dr * dr + dc * dc;
-      // 高斯分布 + 随机噪声
       pressureData[r][c] = PRESSURE_MAX * exp(-dist2 / (2 * sigma * sigma));
       pressureData[r][c] += random(-1, 1);
       pressureData[r][c] = constrain(pressureData[r][c], PRESSURE_MIN, PRESSURE_MAX);
