@@ -316,15 +316,14 @@ void commitFrame() {
 // ==================== 颜色映射 ====================
 
 color pressureToColor(float pressure) {
-  if (Float.isNaN(pressure)) {
-    return color(255, 255, 255);
-  }
+  // NaN 视为零压力，统一显示绿色基底
+  if (Float.isNaN(pressure)) pressure = 0;
 
   pressure = constrain(pressure, PRESSURE_MIN, PRESSURE_MAX);
   float t = map(pressure, PRESSURE_MIN, PRESSURE_MAX, 0.0, 1.0);
 
   float h = map(t, 0.0, 1.0, 120.0, 0.0);
-  float s = map(t, 0.0, 1.0, 25.0, 100.0);
+  float s = map(t, 0.0, 1.0, 60.0, 100.0);  // 最低饱和度60%，确保零压为明确绿色
   float b = map(t, 0.0, 1.0, 100.0, 70.0);
 
   colorMode(HSB, 360, 100, 100);
@@ -394,7 +393,8 @@ void drawBaseGrid() {
 }
 
 void drawHeatmap3D() {
-  // 逐单元格绘制：每格统一颜色，四角使用格点Z高度保持曲面形状
+  // 关闭光照，使正反两面颜色一致（原色渲染，不受法线方向影响）
+  noLights();
   noStroke();
   for (int r = 0; r < ROWS; r++) {
     for (int c = 0; c < COLS; c++) {
@@ -424,6 +424,11 @@ void drawHeatmap3D() {
       endShape();
     }
   }
+
+  // 恢复光照供后续 3D 元素使用
+  lights();
+  directionalLight(255, 255, 255, 0.5, 0.5, -1);
+  ambientLight(100, 100, 100);
 }
 
 void drawLabels3D() {
